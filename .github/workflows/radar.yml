@@ -1,0 +1,43 @@
+name: Calcul du radar
+
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"   # du lundi au vendredi, 23 h 30 heure de Paris (hiver)
+    - cron: "0 6 * * 6"       # samedi matin : calcul complet + backtest
+  workflow_dispatch:
+    inputs:
+      backtest:
+        description: "Refaire aussi le backtest ?"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installation
+        run: pip install yfinance pandas numpy
+      - name: Calcul (5 000+ actions)
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+        run: |
+          BT=""
+          if [ "${{ github.event.schedule }}" = "0 6 * * 6" ] || [ "${{ inputs.backtest }}" = "true" ]; then BT="--avec-backtest"; fi
+          python radar_actions.py preparer $BT
+      - name: Publication du résultat (branche donnees)
+        run: |
+          cd resultats
+          git init -q -b donnees
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add resultats.json.gz
+          git commit -q -m "Résultats du $(date -u +%F)"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" donnees
