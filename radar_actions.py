@@ -301,9 +301,24 @@ def fondamentaux(ticker, demo=False):
                 "freeCashflowYield": float(rng.normal(0.05, 0.04))}
     info = {}
     try:
+        import time
         import yfinance as yf
+        _ecouter_yfinance()
         tk = yf.Ticker(ticker)
-        raw = tk.info or {}
+        raw = {}
+        for essai in range(2):
+            try:
+                raw = tk.info or {}
+            except Exception as e:  # noqa
+                _diag("info", f"{ticker}: {e}")
+                raw = {}
+            if raw.get("marketCap") or raw.get("trailingPE") or raw.get("sector"):
+                DIAG["info_ok"] += 1
+                break
+            DIAG["info_vide"] += 1
+            if essai == 0:
+                time.sleep(3)
+                tk = yf.Ticker(ticker)
         for k in ["longName", "shortName", "sector", "industry", "currency", "marketCap", "forwardPE",
                   "trailingPE", "priceToSalesTrailing12Months", "revenueGrowth", "earningsGrowth",
                   "profitMargins", "returnOnEquity", "debtToEquity", "targetMeanPrice",
@@ -327,6 +342,31 @@ def fondamentaux(ticker, demo=False):
     except Exception:
         pass
     return info
+
+DIAG = {"info_ok": 0, "info_vide": 0, "masse_ok": 0, "messages": []}
+
+
+def _diag(source, msg):
+    if len(DIAG["messages"]) < 25:
+        DIAG["messages"].append(f"[{source}] {str(msg)[:300]}")
+
+
+_ECOUTE = []
+
+
+def _ecouter_yfinance():
+    """Garde les messages d'erreur de yfinance (sinon invisibles) pour comprendre un blocage de Yahoo."""
+    if _ECOUTE:
+        return
+    import logging
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            if rec.levelno >= logging.WARNING:
+                _diag("yfinance", rec.getMessage())
+    logging.getLogger("yfinance").addHandler(H())
+    _ECOUTE.append(1)
+
 
 def _note_analystes(x):
     """'2.1 - Buy' -> 2.1"""
@@ -1666,7 +1706,9 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
     print(f"1/4 Cours sur 2 ans et valorisation de {len(tickers)} actions…")
     maj_change(opts.demo)
     data = telecharger(tickers + INDICES_AUX, annees=2.3, demo=opts.demo)
-    masse = fonda_masse(tickers, demo=opts.demo)
+    # La récupération groupée (v7) semble déclencher un blocage de Yahoo : désactivée sauf si FONDA_MASSE=1.
+    masse = fonda_masse(tickers, demo=opts.demo) if (opts.demo or os.environ.get("FONDA_MASSE") == "1") else {}
+    DIAG["masse_ok"] = len(masse)
     MEDIANES = calculer_medianes(masse, dict(zip(u.ticker, u.secteur)), dict(zip(u.ticker, u.region)))
     print("   médianes PER :", {k: round(v["pe"], 1) for k, v in MEDIANES.items()})
     lignes = []
@@ -1694,24 +1736,45 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
     # finalistes : les meilleures de chaque univers, secteur et taille, dans chacun des deux styles
     final = set()
     tabc = tab.assign(coeur=tab.ticker.map(info["coeur"]) if "coeur" in info else "1")
-    for col in ("note_valeur", "note_momentum"):
+    for col, (n_u, n_s, n_t) in (("note_valeur", (80, 20, 30)), ("note_momentum", (40, 10, 15))):
         for choix in UNIVERS_CHOIX:
-            final |= set(filtrer_univers(tabc, choix).nlargest(50, col).ticker)
+            final |= set(filtrer_univers(tabc, choix).nlargest(n_u, col).ticker)
         for _, g in tabc.groupby("secteur"):
-            final |= set(g.nlargest(15, col).ticker)
+            final |= set(g.nlargest(n_s, col).ticker)
         for _, g in tabc.groupby("taille"):
-            final |= set(g.nlargest(20, col).ticker)
+            final |= set(g.nlargest(n_t, col).ticker)
     final = sorted(final)
     print(f"2/4 Analyse complète de {len(final)} finalistes…")
     data10 = telecharger(final + INDICES_AUX, annees=10, demo=opts.demo)
     meteo = meteo_macro(opts.demo)
     reg = {i: regime_marche(data10, i) for i in TOUS_INDICES}
+    # Fondamentaux détaillés des finalistes, puis médianes de valorisation par secteur et région
+    print(f"   Fondamentaux de {len(final)} finalistes (Yahoo, une par une)…")
+    fondas = {}
+    for i, t in enumerate(final, 1):
+        fondas[t] = {**masse.get(t, {}), **{k: v for k, v in fondamentaux(t, opts.demo).items() if v is not None}}
+        if not opts.demo:
+            time.sleep(0.4)
+        if i % 50 == 0:
+            print(f"   {i}/{len(final)} · réussies {DIAG['info_ok']} · vides {DIAG['info_vide']}", flush=True)
+        if i == 60 and DIAG["info_ok"] == 0 and not opts.demo:
+            print("   ! Yahoo ne renvoie aucun fondamental : pause de 2 minutes puis nouvel essai")
+            time.sleep(120)
+    vides = [t for t in final if not (fondas[t].get("sector") or fondas[t].get("trailingPE") or fondas[t].get("marketCap"))]
+    if vides and DIAG["info_ok"] > 0 and not opts.demo:
+        print(f"   Nouvel essai pour {min(len(vides), 300)} actions sans fondamentaux…")
+        for t in vides[:300]:
+            fondas[t].update({k: v for k, v in fondamentaux(t).items() if v is not None})
+            time.sleep(0.6)
+    if not masse:
+        MEDIANES = calculer_medianes(fondas, dict(zip(u.ticker, u.secteur)), dict(zip(u.ticker, u.region)))
+    print(f"   fondamentaux : {DIAG['info_ok']} réussis, {DIAG['info_vide']} vides ; messages : {DIAG['messages'][:5]}")
     complets = []
     for i, t in enumerate(final, 1):
         df = data10.get(t, data.get(t))
         try:
-            m = analyser(t, info.at[t, "nom"], df, data10.get(indice_de(t)), opts,
-                         fonda_pre=masse.get(t), secteur=info.at[t, "secteur"] or None, region=info.at[t, "region"] or None)
+            m = analyser(t, info.at[t, "nom"], df, data10.get(indice_de(t)), opts, avec_fonda=False,
+                         fonda_pre=fondas.get(t), secteur=info.at[t, "secteur"] or None, region=info.at[t, "region"] or None)
         except Exception as e:  # noqa
             print("   !", t, e)
             continue
@@ -1723,9 +1786,7 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
         for c in cols_info:
             m[c] = info.at[t, c]
         complets.append(m)
-        if not opts.demo:
-            time.sleep(0.3)
-        if i % 25 == 0:
+        if i % 100 == 0:
             print(f"   {i}/{len(final)}")
     bt = None
     if getattr(opts, "avec_backtest", False):
@@ -1747,7 +1808,7 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
     res = {"version": 2, "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "n_univers": len(tickers),
            "n_notees": len(tab), "table": _json(tab.to_dict(orient="list")), "finalistes": [_json(m) for m in complets],
            "regimes": _json(reg), "meteo": _json(meteo), "backtest": _json(bt) if bt else None,
-           "medianes": MEDIANES, "change": CHANGE, "params": {"objectif": opts.objectif, "horizon": opts.horizon}}
+           "medianes": MEDIANES, "change": CHANGE, "diag": DIAG, "params": {"objectif": opts.objectif, "horizon": opts.horizon}}
     os.makedirs(os.path.dirname(sortie), exist_ok=True)
     with gzip.open(sortie, "wt", encoding="utf-8") as f:
         json.dump(res, f)
