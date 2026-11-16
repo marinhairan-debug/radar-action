@@ -102,6 +102,17 @@ SUFFIXES_EUROPE = (".PA", ".DE", ".AS", ".BR", ".MI", ".MC", ".HE", ".CO", ".LS"
                    ".IR", ".ST", ".OL", ".SW", ".L")
 INDICE_EUROPE = "^STOXX"      # Stoxx Europe 600
 INDICE_US = "^GSPC"           # S&P 500
+INDICES_ASIE = {".T": "^N225", ".KS": "^KS11", ".TW": "^TWII"}     # Nikkei 225, Kospi, Taiex
+NOMS_INDICES = {"^STOXX": ("Stoxx 600", "européen"), "^GSPC": ("S&P 500", "américain"), "^N225": ("Nikkei 225", "japonais"),
+                "^KS11": ("Kospi", "coréen"), "^TWII": ("Taiex", "taïwanais")}
+# Devise de cotation selon la bourse, et nombre d'unités pour 1 € (approximatif, mis à jour chaque nuit si possible)
+DEVISES = {".L": "GBp", ".SW": "CHF", ".ST": "SEK", ".OL": "NOK", ".CO": "DKK", ".T": "JPY", ".KS": "KRW", ".TW": "TWD"}
+CHANGE = {"EUR": 1.0, "USD": 1.16, "GBp": 87.0, "CHF": 0.93, "SEK": 10.9, "NOK": 11.7, "DKK": 7.46,
+          "JPY": 178.0, "KRW": 1650.0, "TWD": 36.0}
+# Actions asiatiques analysées sur leur cotation locale, mais achetées chez Trade Republic sous forme de certificat
+CERTIFICATS = {"000660.KS": "SK Hynix : ADR « SKHY » (Nasdaq) ou GDR", "005930.KS": "Samsung Electronics : GDR",
+               "006400.KS": "Samsung SDI : GDR", "066570.KS": "LG Electronics : GDR",
+               "2317.TW": "Hon Hai (Foxconn) : GDR", "2409.TW": "AUO : ADR"}
 VIX = "^VIX"
 TAUX_10A = "^TNX"
 
@@ -114,10 +125,27 @@ SPREAD_ESTIME = 0.001     # 0,1 % d'écart de prix estimé par ordre
 LIQUIDITE_MIN = 2e6       # volume moyen échangé par jour minimum (devise locale)
 JOURS_MIN = 300           # historique minimum pour analyser une action
 
-POIDS = {                 # poids des sous-scores dans la note finale
+POIDS = {                 # style « momentum » : poids des sous-scores dans la note finale
     "momentum": 0.27, "tendance": 0.18, "probabilites": 0.22,
     "volume": 0.10, "risque": 0.08, "fondamentaux": 0.15,
 }
+POIDS_VALEUR = {          # style « sous-cotées en retournement »
+    "valeur": 0.30, "qualite": 0.15, "retournement": 0.25,
+    "decote": 0.10, "probabilites": 0.10, "risque": 0.10,
+}
+STYLES = {"valeur": "Sous-cotées en retournement", "momentum": "Momentum (actions déjà en tendance)"}
+LIBELLES = {"momentum": "Momentum", "tendance": "Tendance", "probabilites": "Probabilités", "volume": "Volume",
+            "risque": "Risque (100 = calme)", "fondamentaux": "Fondamentaux", "valeur": "Valorisation",
+            "qualite": "Qualité (anti-piège)", "retournement": "Retournement", "decote": "Décote"}
+ORDRE_MIN_PEA = 2500  # BoursoBank PEA : ordre minimum hors Euronext (Xetra, Madrid, Milan)
+
+# Médianes de valorisation par secteur (recalculées chaque nuit sur tout l'univers, valeurs par défaut sinon)
+MEDIANES = {"__tout__": {"pe": 16.0, "pb": 2.0}}
+SECTEURS_FR = {"Technology": "Technologie", "Financial Services": "Finance", "Healthcare": "Santé",
+               "Industrials": "Industrie", "Consumer Cyclical": "Consommation cyclique",
+               "Consumer Defensive": "Consommation de base", "Basic Materials": "Matériaux",
+               "Real Estate": "Immobilier", "Energy": "Énergie", "Communication Services": "Communication & médias",
+               "Utilities": "Services aux collectivités"}
 
 # ============================================================================
 # 3. DONNÉES
@@ -268,7 +296,9 @@ def fondamentaux(ticker, demo=False):
                 "targetMeanPrice": None, "recommendationMean": float(rng.uniform(1.5, 3.5)),
                 "numberOfAnalystOpinions": int(rng.integers(3, 40)), "sector": "Démo",
                 "industry": "Démo", "currency": "EUR", "marketCap": float(rng.uniform(1e9, 2e11)),
-                "surprise_pct": float(rng.normal(3, 8)), "prochains_resultats": None}
+                "surprise_pct": float(rng.normal(3, 8)), "prochains_resultats": None,
+                "priceToBook": float(rng.uniform(0.6, 6)), "enterpriseToEbitda": float(rng.uniform(4, 25)),
+                "freeCashflowYield": float(rng.normal(0.05, 0.04))}
     info = {}
     try:
         import yfinance as yf
@@ -277,8 +307,11 @@ def fondamentaux(ticker, demo=False):
         for k in ["longName", "shortName", "sector", "industry", "currency", "marketCap", "forwardPE",
                   "trailingPE", "priceToSalesTrailing12Months", "revenueGrowth", "earningsGrowth",
                   "profitMargins", "returnOnEquity", "debtToEquity", "targetMeanPrice",
-                  "recommendationMean", "numberOfAnalystOpinions", "shortPercentOfFloat"]:
+                  "recommendationMean", "numberOfAnalystOpinions", "shortPercentOfFloat",
+                  "priceToBook", "enterpriseToEbitda", "freeCashflow", "dividendYield"]:
             info[k] = raw.get(k)
+        if info.get("freeCashflow") and info.get("marketCap"):
+            info["freeCashflowYield"] = info["freeCashflow"] / info["marketCap"]
         try:
             ed = tk.get_earnings_dates(limit=8)
             if ed is not None and len(ed):
@@ -294,6 +327,79 @@ def fondamentaux(ticker, demo=False):
     except Exception:
         pass
     return info
+
+def _note_analystes(x):
+    """'2.1 - Buy' -> 2.1"""
+    try:
+        return float(str(x).split()[0])
+    except Exception:
+        return None
+
+
+def fonda_masse(tickers, demo=False, paquet=150):
+    """Valorisation de TOUTES les actions en quelques requêtes (Yahoo, page « quote » groupée).
+    Moins complet que fondamentaux() mais suffisant pour repérer les actions bon marché."""
+    if demo:
+        out = {}
+        for t in tickers:
+            rng = np.random.default_rng(abs(hash(t)) % 2**32)
+            out[t] = {"trailingPE": float(rng.uniform(-10, 60)), "forwardPE": float(rng.uniform(5, 40)),
+                      "priceToBook": float(rng.uniform(0.4, 8)), "epsTrailingTwelveMonths": float(rng.normal(2, 2)),
+                      "marketCap": float(rng.uniform(2e8, 2e11)), "recommendationMean": float(rng.uniform(1.5, 3.5))}
+        return out
+    import time
+    champs = ["trailingPE", "forwardPE", "priceToBook", "marketCap", "epsTrailingTwelveMonths", "epsForward",
+              "bookValue", "dividendYield", "trailingAnnualDividendYield", "currency", "longName"]
+    out = {}
+    try:
+        from yfinance.data import YfData
+        yd = YfData()
+    except Exception as e:  # noqa
+        print("   ! fondamentaux groupés indisponibles :", e)
+        return out
+    for i in range(0, len(tickers), paquet):
+        lot = tickers[i:i + paquet]
+        try:
+            j = yd.get_raw_json("https://query1.finance.yahoo.com/v7/finance/quote",
+                                params={"symbols": ",".join(lot), "formatted": "false", "lang": "en-US", "region": "US"})
+            for q in (j.get("quoteResponse") or {}).get("result") or []:
+                d = {k: q.get(k) for k in champs if q.get(k) is not None}
+                rm = _note_analystes(q.get("averageAnalystRating"))
+                if rm:
+                    d["recommendationMean"] = rm
+                out[q.get("symbol")] = d
+        except Exception as e:  # noqa
+            print(f"   ! fondamentaux {i}-{i + len(lot)} :", str(e)[:120])
+        time.sleep(1.0)
+    print(f"   fondamentaux groupés : {len(out)}/{len(tickers)} actions")
+    return out
+
+
+def calculer_medianes(fonda, secteurs, regions=None):
+    """Médianes de PER et de cours/actif net par secteur, et par région + secteur (sociétés bénéficiaires seulement).
+    Comparer au sein de sa région évite de trouver « pas chères » toutes les actions japonaises ou européennes."""
+    regions = regions or {}
+    df = pd.DataFrame([{"secteur": secteurs.get(t, ""), "region": regions.get(t, ""), "pe": f.get("trailingPE") or f.get("forwardPE"),
+                        "pb": f.get("priceToBook")} for t, f in fonda.items()])
+    if df.empty:
+        return dict(MEDIANES)
+    df["pe"] = pd.to_numeric(df.pe, errors="coerce").where(lambda x: (x > 0) & (x < 300))
+    df["pb"] = pd.to_numeric(df.pb, errors="coerce").where(lambda x: (x > 0) & (x < 100))
+    res = {"__tout__": {"pe": float(df.pe.median()), "pb": float(df.pb.median())}}
+    for s, g in df.groupby("secteur"):
+        if s and g.pe.count() >= 15:
+            res[s] = {"pe": float(g.pe.median()), "pb": float(g.pb.median()) if g.pb.count() >= 15 else res["__tout__"]["pb"]}
+    for (r, s), g in df.groupby(["region", "secteur"]):
+        if r and s and g.pe.count() >= 15:
+            res[f"{r}|{s}"] = {"pe": float(g.pe.median()),
+                               "pb": float(g.pb.median()) if g.pb.count() >= 15 else res.get(s, res["__tout__"])["pb"]}
+    return res
+
+
+def mediane_de(m):
+    s = m.get("secteur") or ""
+    return MEDIANES.get(f"{m.get('region', '')}|{s}") or MEDIANES.get(s) or MEDIANES["__tout__"]
+
 
 # ============================================================================
 # 4. OUTILS STATISTIQUES
@@ -460,7 +566,7 @@ def regime_marche(donnees, indice):
     points = (2 if au200 else -2) + (1 if r3m > 0 else -1) + (-1 if pct_vol > 0.8 else 0) \
         + (-1 if (vix_niv or 0) > 25 else 0)
     etat = "favorable" if points >= 2 else ("prudence" if points >= 0 else "défavorable")
-    nom = "Stoxx 600" if indice == INDICE_EUROPE else "S&P 500"
+    nom = NOMS_INDICES.get(indice, (indice, ""))[0]
     morceaux = [f"{nom} {'au-dessus' if au200 else 'en dessous'} de sa moyenne 200 jours",
                 f"{r3m:+.1%} sur 3 mois", f"volatilité au {pct_vol:.0%} de ses 5 dernières années"]
     if vix_niv:
@@ -478,7 +584,7 @@ def _sig(x):
     return 1 / (1 + math.exp(-x))
 
 
-def analyser(ticker, nom, df, indice_df, opts, avec_fonda=True, avec_proba=True):
+def analyser(ticker, nom, df, indice_df, opts, avec_fonda=True, avec_proba=True, fonda_pre=None, secteur=None, region=None):
     df = df.dropna(subset=["Close"])
     df = df[df.Close > 0]
     if len(df) < JOURS_MIN:
@@ -521,20 +627,34 @@ def analyser(ticker, nom, df, indice_df, opts, avec_fonda=True, avec_proba=True)
     m["z5"] = float((c.iloc[-1] / c.iloc[-6] - 1) / (sd * math.sqrt(5))) if sd > 0 else 0.0
     m["ext_atr"] = float((c.iloc[-1] - ma20.iloc[-1]) / a.iloc[-1])
 
+    # --- Variables « décote et retournement »
+    m["r2a"] = float(c.iloc[-1] / c.iloc[-504] - 1) if len(c) > 504 else np.nan
+    m["dist_bas52"] = float(c.iloc[-1] / df.Low.iloc[-252:].min() - 1)
+    m["dist_ma200"] = float(c.iloc[-1] / ma200.iloc[-1] - 1)
+    m["pente20"] = float(ma20.iloc[-1] / ma20.iloc[-6] - 1)
+    m["pente50"] = float(ma50.iloc[-1] / ma50.iloc[-11] - 1)
+    dessous50 = (c < ma50).iloc[-16:-1]
+    m["reprise50"] = bool(c.iloc[-1] > ma50.iloc[-1] and dessous50.any())
+    rs = rsi(c)
+    m["rsi_min15"] = float(rs.iloc[-15:].min())
+    m["rsi_rebond"] = bool(m["rsi_min15"] < 40 and rs.iloc[-1] > 50)
+    m["creux_montant"] = bool(df.Low.iloc[-10:].min() > df.Low.iloc[-30:-10].min())
+    m["couteau"] = bool(c.iloc[-1] < ma20.iloc[-1] and m["pente20"] < 0 and m["r1m"] < -0.08)
+
     # --- Volume
     m["rvol"] = float(v.iloc[-5:].mean() / max(1, v.iloc[-65:-5].mean()))
     up_days = r.iloc[-50:] > 0
     m["updown"] = float(v.iloc[-50:][up_days].sum() / max(1, v.iloc[-50:][~up_days].sum()))
-    m["liquidite"] = float((c * v).iloc[-20:].mean())
+    m["liquidite"] = float((c * v).iloc[-20:].mean()) / taux(ticker)        # en euros
 
     # --- Plan de trade
     stop_px = max(c.iloc[-1] - 2 * a.iloc[-1], c.iloc[-1] * (1 - 0.12))
     m["stop_pct"] = float(1 - stop_px / c.iloc[-1])
     m["stop"] = float(stop_px)
     m["objectif1"] = float(c.iloc[-1] + 2 * (c.iloc[-1] - stop_px))
-    risque_eur = opts.capital * opts.risque / 100
-    qte = risque_eur / (c.iloc[-1] - stop_px)
-    qte = min(qte, 0.25 * opts.capital / c.iloc[-1])
+    cap_local = opts.capital * taux(ticker)                 # capital converti dans la devise de l'action
+    qte = cap_local * opts.risque / 100 / (c.iloc[-1] - stop_px)
+    qte = min(qte, 0.25 * cap_local / c.iloc[-1])
     m["quantite"] = int(max(0, math.floor(qte)))
     m["montant"] = float(m["quantite"] * c.iloc[-1])
 
@@ -545,13 +665,33 @@ def analyser(ticker, nom, df, indice_df, opts, avec_fonda=True, avec_proba=True)
         m["boot_hist"] = bootstrap_barrieres(c, obj, m["stop_pct"], opts.horizon, demean=False)
         m["boot_neutre"] = bootstrap_barrieres(c, obj, m["stop_pct"], opts.horizon, demean=True)
         m["saison"] = saisonnalite(c)
-    m["fonda"] = fondamentaux(ticker, opts.demo) if avec_fonda else {}
-    m["devise"] = m["fonda"].get("currency") or ("EUR" if ticker.upper().endswith(SUFFIXES_EUROPE) else "USD")
+    m["fonda"] = {**(fonda_pre or {}), **({k: v for k, v in fondamentaux(ticker, opts.demo).items() if v is not None} if avec_fonda else {})}
+    m["secteur"] = secteur or SECTEURS_FR.get(m["fonda"].get("sector"), m["fonda"].get("sector") or "")
+    m["region"] = region or ("Asie" if indice_de(ticker) in INDICES_ASIE.values() else
+                             "Europe" if indice_de(ticker) == INDICE_EUROPE else "US")
+    m["devise"] = devise_de(ticker)
+    m["montant_eur"] = m["montant"] / taux(ticker)
     m["courbe"] = c.iloc[-252:]
     m["courbe_ma50"] = ma50.iloc[-252:]
     m["courbe_ma200"] = ma200.iloc[-252:]
     noter(m)
+    alertes_courtier(m)
     return m
+
+
+def alertes_courtier(m):
+    """Points pratiques pour passer l'ordre chez Trade Republic."""
+    t, txt = m["ticker"], []
+    if t in CERTIFICATS:
+        txt.append(f"Analyse faite sur l'action locale ; chez Trade Republic tu achètes le certificat {CERTIFICATS[t]}. "
+                   "Le stop et l'objectif sont à transposer en % sur le certificat")
+    elif t.upper().endswith(tuple(INDICES_ASIE)):
+        txt.append("Action asiatique : chez Trade Republic l'ordre passe en euros sur une place allemande pendant que sa bourse "
+                   "est fermée → écart de prix plus large, ordre à cours limité obligatoire, risque d'écart de cours la nuit")
+    if t.upper().endswith(tuple(INDICES_ASIE)) and m["liquidite"] < 5 * LIQUIDITE_MIN and t not in CERTIFICATS:
+        txt.append("Peu échangée en Europe : vérifie l'écart achat/vente dans l'appli avant de passer l'ordre")
+    for st_ in m["styles"].values():
+        st_["alertes"].extend(txt)
 
 # ============================================================================
 # 7. NOTATION ET EXPLICATIONS
@@ -561,7 +701,47 @@ def _f(x, fmt="{:+.1%}"):
     return "n.d." if x is None or (isinstance(x, float) and np.isnan(x)) else fmt.format(x)
 
 
-def noter(m):
+def _verdict(n):
+    return "Fort potentiel" if n >= 72 else "Intéressant" if n >= 60 else "Neutre" if n >= 45 else "À éviter"
+
+
+def _moyenne_ponderee(s, poids):
+    tot, w = 0.0, 0.0
+    for k, p in poids.items():
+        if s.get(k) is not None:
+            tot += p * s[k]
+            w += p
+    return tot / w if w else 50.0
+
+
+def noter(m, style=None):
+    """Calcule les deux notes (style « valeur » et style « momentum ») et applique le style demandé."""
+    s, pos, neg, al, note = _noter_momentum(m)
+    m["styles"] = {"momentum": {"note": note, "scores": {k: s.get(k) for k in POIDS}, "positifs": pos,
+                                "negatifs": neg, "alertes": al}}
+    sv, posv, negv, alv, notev = _noter_valeur(m, s)
+    m["styles"]["valeur"] = {"note": notev, "scores": {k: sv.get(k) for k in POIDS_VALEUR}, "positifs": posv,
+                             "negatifs": negv, "alertes": alv}
+    for st_ in m["styles"].values():
+        st_["note"] = float(max(0, min(100, st_["note"])))
+        st_["verdict"] = _verdict(st_["note"])
+        st_["scores"] = {k: (None if v is None else float(v)) for k, v in st_["scores"].items()}
+    m["note_valeur"], m["note_momentum"] = m["styles"]["valeur"]["note"], m["styles"]["momentum"]["note"]
+    appliquer_style(m, style or "valeur")
+
+
+def appliquer_style(m, style):
+    """Copie la note, l'avis et les raisons du style choisi dans les champs affichés."""
+    if style not in m["styles"]:
+        style = next(iter(m["styles"]))
+    st_ = m["styles"][style]
+    m["style"] = style
+    m["note"], m["verdict"], m["scores"] = st_["note"], st_["verdict"], st_["scores"]
+    m["positifs"], m["negatifs"], m["alertes"] = st_["positifs"], st_["negatifs"], st_["alertes"]
+    return m
+
+
+def _noter_momentum(m):
     s, pos, neg, alertes = {}, [], [], []
     vol = max(m["vol"], 0.10)
 
@@ -667,13 +847,7 @@ def noter(m):
         alertes.append(f"Prochains résultats le {fd['prochains_resultats']} : risque de gap")
     s["fondamentaux"] = float(np.mean(notes)) if notes else None
 
-    # Note finale
-    tot, poids = 0.0, 0.0
-    for k, w in POIDS.items():
-        if s.get(k) is not None:
-            tot += w * s[k]
-            poids += w
-    note = tot / poids
+    note = _moyenne_ponderee(s, POIDS)
 
     # Pénalités
     if m["z5"] > 2.5 or m["ext_atr"] > 4:
@@ -688,12 +862,171 @@ def noter(m):
     if m["liquidite"] < LIQUIDITE_MIN:
         note -= 10
         alertes.append("Faible liquidité : écart de prix (spread) élevé, ordres à cours limité obligatoires")
+    return s, pos, neg, alertes, note
 
-    m["scores"] = {k: (None if v is None else float(v)) for k, v in s.items()}
-    m["note"] = float(max(0, min(100, note)))
-    m["verdict"] = ("Fort potentiel" if m["note"] >= 72 else "Intéressant" if m["note"] >= 60
-                    else "Neutre" if m["note"] >= 45 else "À éviter")
-    m["positifs"], m["negatifs"], m["alertes"] = pos, neg, alertes
+
+def _rel_score(rel, echelle=0.5):
+    """rel = multiple de l'action / médiane du secteur. 0,5 -> ~85 ; 1 -> 50 ; 2 -> ~15."""
+    return 50 - 40 * math.tanh(math.log(max(rel, 1e-3)) / echelle)
+
+
+def _noter_valeur(m, s_mom):
+    """Actions bon marché (fondamentaux), décotées (cours), mais qui commencent à se retourner (technique + statistiques).
+    La qualité sert à éviter les « pièges à valeur » : une action peu chère parce qu'elle va mal."""
+    s, pos, neg, al = {}, [], [], []
+    fd = m.get("fonda") or {}
+    med = mediane_de(m)
+    med_tout = MEDIANES["__tout__"]
+    nom_sect = (m.get("secteur") or "marché") + (f", {m['region']}" if m.get("region") else "")
+
+    # --- Valorisation (fondamentaux relatifs au secteur)
+    v = []
+    pe = fd.get("trailingPE")
+    fpe = fd.get("forwardPE")
+    eps = fd.get("epsTrailingTwelveMonths")
+    pe_ref = med.get("pe") or med_tout["pe"]
+    if pe and pe > 0:
+        rel = pe / pe_ref
+        v.append(_rel_score(rel))
+        if rel < 0.7:
+            pos.append(f"PER {pe:.1f} contre {pe_ref:.0f} en médiane ({nom_sect}) : {1 - rel:.0%} moins cher que ses pairs")
+        elif rel > 1.6:
+            neg.append(f"PER {pe:.0f}, nettement plus cher que la médiane de son secteur ({pe_ref:.0f})")
+    elif (pe is not None and pe <= 0) or (eps is not None and eps < 0):
+        v.append(20)
+    if fpe and fpe > 0:
+        v.append(_rel_score(fpe / pe_ref))
+        if pe and pe > 0 and fpe < 0.8 * pe:
+            pos.append(f"PER prévisionnel {fpe:.1f} < PER actuel {pe:.1f} : bénéfices attendus en hausse")
+    pb = fd.get("priceToBook")
+    pb_ref = med.get("pb") or med_tout["pb"]
+    if pb and pb > 0:
+        v.append(_rel_score(pb / pb_ref, 0.6))
+        if pb < 1:
+            pos.append(f"Se paie {pb:.2f} fois son actif net (moins que ce que possède l'entreprise sur le papier)")
+    ev = fd.get("enterpriseToEbitda")
+    if ev and ev > 0:
+        v.append(80 if ev < 6 else 65 if ev < 10 else 50 if ev < 15 else 35 if ev < 25 else 20)
+        if ev < 7:
+            pos.append(f"Valeur d'entreprise / EBITDA de {ev:.1f} : bas")
+    fcy = fd.get("freeCashflowYield")
+    if fcy is not None:
+        v.append(50 + 50 * math.tanh((fcy - 0.04) / 0.05))
+        if fcy > 0.08:
+            pos.append(f"Rendement de trésorerie disponible (FCF) de {fcy:.0%} par an au prix actuel")
+        elif fcy < 0:
+            neg.append("Brûle de la trésorerie (flux de trésorerie disponible négatif)")
+    s["valeur"] = float(np.mean(v)) if v else None
+
+    # --- Qualité (anti-piège à valeur)
+    q = []
+    roe = fd.get("returnOnEquity")
+    if roe is not None:
+        q.append(50 + 50 * math.tanh((roe - 0.10) / 0.10))
+    pm = fd.get("profitMargins")
+    if pm is not None:
+        q.append(20 if pm < 0 else 50 + 50 * math.tanh((pm - 0.06) / 0.10))
+    de = fd.get("debtToEquity")
+    if de is not None:
+        q.append(80 if de < 50 else 60 if de < 100 else 40 if de < 200 else 20)
+        if de > 200 and m.get("secteur") != "Finance":
+            neg.append(f"Endettement élevé (dette = {de / 100:.1f}× les capitaux propres)")
+    g = fd.get("revenueGrowth")
+    if g is not None:
+        q.append(50 + 50 * math.tanh(g / 0.12))
+        if g < -0.05:
+            neg.append(f"Chiffre d'affaires en recul ({_f(g)}) : la décote est peut-être méritée")
+    sp = fd.get("surprise_pct")
+    if sp is not None:
+        q.append(50 + 50 * math.tanh(sp / 10))
+        if sp > 5:
+            pos.append(f"Derniers résultats au-dessus des attentes ({sp:+.1f} %)")
+    if not q and eps is not None:
+        q.append(60 if eps > 0 else 25)
+    s["qualite"] = float(np.mean(q)) if q else None
+    if roe is not None and roe > 0.12 and (pm or 0) > 0.08:
+        pos.append(f"Entreprise rentable (rentabilité des capitaux propres {roe:.0%}, marge {pm:.0%}) : décote moins suspecte")
+
+    # --- Décote (cours et analystes)
+    d = -m["dist52"]
+    dt_ = float(np.interp(d, [0, 0.05, 0.2, 0.5, 0.7, 1.0], [15, 20, 85, 85, 40, 25]))
+    dc = [dt_]
+    if 0.2 <= d <= 0.6:
+        pos.append(f"À {_f(m['dist52'])} de son plus haut sur 1 an : marge de rattrapage")
+    elif d < 0.08:
+        al.append("Proche de son plus haut annuel : peu de décote sur le cours")
+    if not np.isnan(m.get("r2a", np.nan)):
+        dc.append(50 - 40 * math.tanh(m["r2a"] / 0.5))
+        if m["r2a"] < -0.3:
+            pos.append(f"{_f(m['r2a'])} sur 2 ans : les grands perdants sur 2-3 ans rebondissent plus souvent que la moyenne (effet de retour à la moyenne)")
+    tgt, nb = fd.get("targetMeanPrice"), fd.get("numberOfAnalystOpinions") or 0
+    if tgt and nb >= 3:
+        up = tgt / m["prix"] - 1
+        m["potentiel_analystes"] = up
+        dc.append(50 + 50 * math.tanh(up / 0.25))
+        if up > 0.2:
+            pos.append(f"Objectif moyen de {nb} analystes : {tgt:.2f} ({_f(up)})")
+        elif up < 0:
+            al.append(f"Cours déjà au-dessus de l'objectif des analystes ({tgt:.2f})")
+    s["decote"] = float(np.mean(dc))
+
+    # --- Retournement (technique)
+    r = 0
+    if m["reprise50"]:
+        r += 25
+        pos.append("Vient de repasser au-dessus de sa moyenne 50 jours : premier signe de reprise")
+    elif m["au50"]:
+        r += 12
+    if m["rsi_rebond"]:
+        r += 20
+        pos.append(f"RSI remonté au-dessus de 50 après un passage à {m['rsi_min15']:.0f} : la pression vendeuse s'essouffle")
+    if m["creux_montant"]:
+        r += 20
+        pos.append("Plus bas récent plus haut que le précédent : le creux se forme peut-être")
+    if m["pente20"] > 0:
+        r += 15
+    if m["updown"] > 1.1:
+        r += 10
+        if m["updown"] >= 1.3:
+            pos.append(f"Accumulation : {m['updown']:.1f}× plus de volume les jours de hausse (50 j)")
+    if m["r1m"] > 0:
+        r += 10
+    s["retournement"] = float(min(100, r))
+    if r < 30:
+        neg.append("Aucun signe de retournement pour l'instant : attendre que le cours se stabilise")
+
+    # --- Mathématiques : l'action a-t-elle tendance à revenir vers sa moyenne ?
+    s["probabilites"] = s_mom.get("probabilites")
+    s["risque"] = s_mom.get("risque")
+    if not np.isnan(m.get("vr_z", np.nan)) and m["vr_z"] < -1.5:
+        pos.append(f"Ratio de variance {m['vr']:.2f} (z {m['vr_z']:+.1f}) : ses excès ont tendance à se corriger, favorable à un rebond")
+    elif not np.isnan(m.get("hurst", np.nan)) and m["hurst"] < 0.45:
+        pos.append(f"Exposant de Hurst {m['hurst']:.2f} : comportement de retour à la moyenne")
+    an = m.get("analogues") or {}
+    if an.get("moyenne") is not None:
+        edge = an["moyenne"] - an["base_moyenne"]
+        txt = (f"Situations similaires dans son passé ({an['n']} cas) : {_f(an['moyenne'])} en moyenne sur {an['horizon']} jours, "
+               f"hausse dans {an['taux_gain']:.0%} des cas")
+        (pos if edge > 0.005 else neg if edge < -0.005 else al).append(txt)
+
+    note = _moyenne_ponderee(s, POIDS_VALEUR)
+    # Pénalités
+    if m["couteau"]:
+        note -= 12
+        al.insert(0, f"Couteau qui tombe : {_f(m['r1m'])} sur 1 mois, sous une moyenne 20 j en baisse. Attendre une stabilisation")
+    if (pe is not None and pe <= 0) or (eps is not None and eps < 0) or (pm is not None and pm < 0):
+        note -= 8
+        neg.append("Entreprise en perte : « pas chère » ne veut rien dire sans bénéfices")
+    if m["liquidite"] < LIQUIDITE_MIN:
+        note -= 10
+        al.append("Faible liquidité : écart de prix (spread) élevé, ordres à cours limité obligatoires")
+    if m["rsi"] > 80:
+        note -= 5
+    if s["valeur"] is None:
+        al.append("Pas de données de valorisation : note fondée sur le cours seulement")
+    if fd.get("prochains_resultats"):
+        al.append(f"Prochains résultats le {fd['prochains_resultats']} : risque de gap")
+    return s, pos, neg, al, note
 
 # ============================================================================
 # 8. RAPPORT HTML
@@ -777,10 +1110,17 @@ def carte_html(m, opts, detail=False):
            f'<div class="muted">{e(str(fd.get("sector") or ""))} {("· " + e(str(fd.get("industry")))) if fd.get("industry") else ""}'
            f' · cours {m["prix"]:.2f} au {m["date"]}</div></div>'
            f'<div style="text-align:right"><div class="note">{m["note"]:.0f}<span class="muted" style="font-size:14px">/100</span></div>{_badge(m["verdict"])}</div></div>']
+    autre = "momentum" if m.get("style", "valeur") == "valeur" else "valeur"
+    dispo = []
+    if m.get("pea_bourso") in ("1", "2"):
+        dispo.append("PEA BoursoBank" + (f" (ordre min. {ORDRE_MIN_PEA} €)" if m.get("pea_bourso") == "2" else ""))
+    if m.get("cto") == "1":
+        dispo.append("CTO Trade Republic")
+    out.append(f'<div class="small muted">Style affiché : <b>{STYLES[m.get("style", "valeur")]}</b> · '
+               f'note dans l\'autre style ({STYLES[autre].split(" (")[0].lower()}) : {m.get("note_" + autre, float("nan")):.0f}/100'
+               + (f' · disponible : {" · ".join(dispo)}' if dispo else "") + '</div>')
     out.append('<div class="grid">' + "".join(
-        f'<div class="kpi"><span>{lab}</span><b>{_bar(sc.get(k))}</b></div>' for k, lab in
-        [("momentum", "Momentum"), ("tendance", "Tendance"), ("probabilites", "Probabilités"),
-         ("volume", "Volume"), ("risque", "Risque (100 = calme)"), ("fondamentaux", "Fondamentaux")]) + "</div>")
+        f'<div class="kpi"><span>{LIBELLES[k]}</span><b>{_bar(sc.get(k))}</b></div>' for k in sc) + "</div>")
     out.append(_liste("Points forts", m["positifs"], "pos"))
     out.append(_liste("Points faibles", m["negatifs"], "neg"))
     out.append(_liste("Points d'attention", m["alertes"], "al"))
@@ -792,10 +1132,17 @@ def carte_html(m, opts, detail=False):
                    f"<span>espérance {_f(bn['esperance'])} par trade</span></div></div>"
                    "<div class='small muted'>Simulation de 4 000 trajectoires en rejouant des blocs de vrais rendements des 2 dernières années. "
                    "La réalité se situe généralement entre les deux : la tendance passée ne continue pas toujours.</div>")
+    def _e(x):
+        return f"{x:,.0f}".replace(",", " ")
+    eur = "" if m.get("devise") == "EUR" else f" (≈ {_e(m.get('montant_eur', 0))} €)"
     plan = (f"<div class='plan'><b>Plan de trade indicatif</b> — entrée vers {m['prix']:.2f} · stop {m['stop']:.2f} "
             f"(−{m['stop_pct']:.1%}, 2 ATR) · vendre la moitié à {m['objectif1']:.2f} (+{m['objectif1'] / m['prix'] - 1:.0%}, 2× le risque) "
-            f"puis suivre le reste sous la moyenne 50 jours · taille : {_taille(m)} ≈ {m['montant']:,.0f} {m.get('devise', '')} "
-            f"pour risquer {opts.risque:g} % de {opts.capital:,.0f} €</div>").replace(",", " ")
+            f"puis suivre le reste sous la moyenne 50 jours · taille : {_taille(m)} ≈ {_e(m['montant'])} {m.get('devise', '')}"
+            f"{eur} "
+            f"pour risquer {opts.risque:g} % de {_e(opts.capital)} €"
+            + (f" · ⚠️ sur le PEA BoursoBank cette bourse impose un ordre d'au moins {ORDRE_MIN_PEA} €"
+               if m.get("pea_bourso") == "2" and m.get("cto") != "1" and m["montant"] < ORDRE_MIN_PEA else "")
+            + "</div>")
     out.append(plan)
     if detail:
         out.append("<h3>Graphique</h3>" + _svg(m))
@@ -807,7 +1154,9 @@ def carte_html(m, opts, detail=False):
                  ("t-stat 6 mois", _f(m["t_stat_6m"], "{:.2f}")), ("Hurst", _f(m["hurst"], "{:.2f}")),
                  ("Ratio de variance (5 j)", f"{_f(m['vr'], '{:.2f}')} (z {_f(m['vr_z'], '{:+.1f}')})"),
                  ("RSI 14", _f(m["rsi"], "{:.0f}")), ("ATR", _f(m["atr_pct"], "{:.1%}")),
-                 ("Volume relatif 5 j", _f(m["rvol"], "{:.2f}×")), ("Volume hausse/baisse 50 j", _f(m["updown"], "{:.2f}×"))]
+                 ("Volume relatif 5 j", _f(m["rvol"], "{:.2f}×")), ("Volume hausse/baisse 50 j", _f(m["updown"], "{:.2f}×")),
+                 ("Perf. 2 ans", _f(m.get("r2a"))), ("Au-dessus du plus bas 52 sem.", _f(m.get("dist_bas52"))),
+                 ("Écart à la moyenne 200 j", _f(m.get("dist_ma200"))), ("RSI min. 15 j", _f(m.get("rsi_min15"), "{:.0f}"))]
         out.append("<h3>Statistiques</h3><div class='grid'>" + "".join(
             f"<div class='kpi'><span>{a}</span><b>{b}</b></div>" for a, b in stats) + "</div>")
         if an.get("moyenne") is not None:
@@ -834,7 +1183,12 @@ def carte_html(m, opts, detail=False):
                     ("Objectif analystes", fd.get("targetMeanPrice"), "{:.2f}"),
                     ("Recommandation (1 = achat fort, 5 = vente)", fd.get("recommendationMean"), "{:.1f}"),
                     ("Nombre d'analystes", fd.get("numberOfAnalystOpinions"), "{:.0f}"),
-                    ("Dernière surprise de résultats", fd.get("surprise_pct"), "{:+.1f} %")]
+                    ("Dernière surprise de résultats", fd.get("surprise_pct"), "{:+.1f} %"),
+                    ("Cours / actif net (P/B)", fd.get("priceToBook"), "{:.2f}"),
+                    ("Valeur d'entreprise / EBITDA", fd.get("enterpriseToEbitda"), "{:.1f}"),
+                    ("Rendement FCF", fd.get("freeCashflowYield"), "{:.1%}"),
+                    (f"PER médian du secteur ({m.get('secteur') or 'marché'})",
+                     mediane_de(m).get("pe"), "{:.1f}")]
             out.append("<h3>Fondamentaux</h3><div class='grid'>" + "".join(
                 f"<div class='kpi'><span>{a}</span><b>{_f(v, f) if v is not None else 'n.d.'}</b></div>" for a, v, f in rows) + "</div>")
     out.append("</div>")
@@ -867,18 +1221,22 @@ def ecrire_rapport(nom, contenu, ouvrir=True):
 # ============================================================================
 
 FICHIER_UNIVERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "univers.csv")
-UNIVERS_CHOIX = {"pea": "Europe éligible PEA", "europe": "Europe (dont Royaume-Uni, Suisse, Norvège)",
-                 "us": "États-Unis", "tout": "Europe + États-Unis", "petites": "Petites valeurs uniquement",
-                 "coeur": "Liste courte (≈ 1 000 valeurs principales)"}
+UNIVERS_CHOIX = {"tout": "Tout (PEA BoursoBank + CTO Trade Republic)", "pea": "PEA BoursoBank",
+                 "cto": "CTO Trade Republic", "europe": "Europe", "us": "États-Unis", "asie": "Japon & Asie",
+                 "petites": "Petites valeurs uniquement", "coeur": "Liste courte (valeurs principales)"}
 
 
 def filtrer_univers(u, choix):
     if choix == "pea":
         return u[u.pea == "1"]
+    if choix == "cto":
+        return u[u.cto == "1"] if "cto" in u else u
     if choix == "europe":
         return u[u.region == "Europe"]
     if choix == "us":
         return u[u.region == "US"]
+    if choix == "asie":
+        return u[u.region == "Asie"]
     if choix == "semis":
         return u[u.secteur == "Semi-conducteurs"]
     if choix == "petites":
@@ -889,9 +1247,13 @@ def filtrer_univers(u, choix):
 
 
 def _lire_univers():
+    """Univers limité aux actions achetables : PEA chez BoursoBank ou compte-titres chez Trade Republic."""
     if not os.path.exists(FICHIER_UNIVERS):
         return None
-    return pd.read_csv(FICHIER_UNIVERS, sep=";", dtype=str).fillna("")
+    u = pd.read_csv(FICHIER_UNIVERS, sep=";", dtype=str).fillna("")
+    if "cto" in u:
+        u = u[(u.cto == "1") | (u.pea == "1")].reset_index(drop=True)
+    return u
 
 
 def charger_univers(choix):
@@ -918,23 +1280,68 @@ def charger_univers(choix):
 
 
 def ajuster_regime(m, regime, macro_zone=None):
-    """Le contexte de marché et la macro pèsent sur la note : les achats en tendance échouent plus souvent en marché baissier."""
-    if macro_zone and macro_zone.get("etat") == "défavorable":
-        m["note"] = max(0.0, m["note"] - 4)
-        m["alertes"].insert(0, "Macro défavorable dans sa zone (voir la météo économique) : note réduite de 4 points")
-    elif macro_zone and macro_zone.get("etat") == "favorable":
-        m["note"] = min(100.0, m["note"] + 2)
-    if regime.get("etat") == "défavorable":
-        m["note"] = max(0.0, m["note"] - 8)
-        m["alertes"].insert(0, "Marché global baissier : la note est réduite de 8 points, la plupart des cassures échouent dans ce contexte")
-    elif regime.get("etat") == "prudence":
-        m["note"] = max(0.0, m["note"] - 3)
-    m["verdict"] = ("Fort potentiel" if m["note"] >= 72 else "Intéressant" if m["note"] >= 60
-                    else "Neutre" if m["note"] >= 45 else "À éviter")
+    """Le contexte de marché et la macro pèsent sur les deux notes : les achats échouent plus souvent en marché baissier."""
+    for nom_style, st_ in m["styles"].items():
+        n = st_["note"]
+        st_["alertes"] = list(st_["alertes"])
+        if macro_zone and macro_zone.get("etat") == "défavorable":
+            n -= 4
+            st_["alertes"].insert(0, "Macro défavorable dans sa zone (voir la météo économique) : note réduite de 4 points")
+        elif macro_zone and macro_zone.get("etat") == "favorable":
+            n += 2
+        if regime.get("etat") == "défavorable":
+            malus = 8 if nom_style == "momentum" else 5
+            n -= malus
+            st_["alertes"].insert(0, f"Marché global baissier : note réduite de {malus} points, la plupart des achats échouent dans ce contexte")
+        elif regime.get("etat") == "prudence":
+            n -= 3
+        st_["note"] = float(max(0.0, min(100.0, n)))
+        st_["verdict"] = _verdict(st_["note"])
+    m["note_valeur"], m["note_momentum"] = m["styles"]["valeur"]["note"], m["styles"]["momentum"]["note"]
+    appliquer_style(m, m.get("style", "valeur"))
 
 
 def indice_de(ticker):
-    return INDICE_EUROPE if ticker.upper().endswith(SUFFIXES_EUROPE) else INDICE_US
+    t = ticker.upper()
+    for suf, ind in INDICES_ASIE.items():
+        if t.endswith(suf):
+            return ind
+    return INDICE_EUROPE if t.endswith(SUFFIXES_EUROPE) else INDICE_US
+
+
+def devise_de(ticker):
+    t = ticker.upper()
+    for suf, dev in DEVISES.items():
+        if t.endswith(suf.upper()):
+            return dev
+    return "EUR" if t.endswith(SUFFIXES_EUROPE) else "USD"
+
+
+def taux(ticker):
+    """Unités de devise locale pour 1 €."""
+    return CHANGE.get(devise_de(ticker), 1.0)
+
+
+def maj_change(demo=False):
+    """Met à jour les taux de change (Yahoo). En cas d'échec, garde les valeurs approximatives."""
+    if demo:
+        return CHANGE
+    paires = {"USD": "EURUSD=X", "GBp": "EURGBP=X", "CHF": "EURCHF=X", "SEK": "EURSEK=X", "NOK": "EURNOK=X",
+              "DKK": "EURDKK=X", "JPY": "EURJPY=X", "KRW": "EURKRW=X", "TWD": "EURTWD=X"}
+    try:
+        d = telecharger(list(paires.values()), annees=0.1, reessai=0)
+        for dev, sym in paires.items():
+            if sym in d and len(d[sym]):
+                v = float(d[sym].Close.dropna().iloc[-1])
+                CHANGE[dev] = v * 100 if dev == "GBp" else v
+    except Exception as e:  # noqa
+        print("   ! taux de change :", e)
+    return CHANGE
+
+
+def indices_de_univers(choix):
+    return {"pea": [INDICE_EUROPE], "europe": [INDICE_EUROPE], "us": [INDICE_US],
+            "asie": list(INDICES_ASIE.values())}.get(choix, [INDICE_EUROPE, INDICE_US] + list(INDICES_ASIE.values()))
 
 
 CONSEIL_REGIME = {
@@ -943,7 +1350,8 @@ CONSEIL_REGIME = {
     "défavorable": "Contexte baissier : la plupart des achats en tendance échouent dans ces phases. Rester très sélectif ou en liquidités.",
     "inconnu": "",
 }
-INDICES_AUX = [INDICE_EUROPE, INDICE_US, VIX, TAUX_10A]
+INDICES_AUX = [INDICE_EUROPE, INDICE_US, VIX, TAUX_10A] + list(INDICES_ASIE.values())
+TOUS_INDICES = [INDICE_EUROPE, INDICE_US] + list(INDICES_ASIE.values())
 
 
 def meteo_macro(demo=False):
@@ -958,7 +1366,20 @@ def meteo_macro(demo=False):
 def macro_de(meteo, ticker):
     if not meteo:
         return None
-    return meteo["Europe" if indice_de(ticker) == INDICE_EUROPE else "US"]
+    i = indice_de(ticker)
+    return meteo["Europe"] if i == INDICE_EUROPE else meteo["US"] if i == INDICE_US else None
+
+
+def _style(opts):
+    return getattr(opts, "style", "valeur") or "valeur"
+
+
+def infos_univers(ticker):
+    """Secteur, disponibilité PEA/CTO… d'une action de l'univers (dict vide si inconnue)."""
+    u = _lire_univers()
+    if u is None or ticker not in set(u.ticker):
+        return {}
+    return u.set_index("ticker").loc[ticker].to_dict()
 
 
 def scan(opts, data=None, progression=None, meteo=None):
@@ -974,7 +1395,7 @@ def scan(opts, data=None, progression=None, meteo=None):
             continue
         m = analyser(t, nom, data[t], data.get(indice_de(t)), opts, avec_fonda=False, avec_proba=False)
         if m and m["liquidite"] >= LIQUIDITE_MIN / 4:
-            res.append(m)
+            res.append(appliquer_style(m, _style(opts)))
     res.sort(key=lambda m: -m["note"])
     finalistes = res[:max(opts.top * 2, 30)]
     complet = []
@@ -983,13 +1404,12 @@ def scan(opts, data=None, progression=None, meteo=None):
             progression(i / len(finalistes), m["ticker"])
         mm = analyser(m["ticker"], m["nom"], data[m["ticker"]], data.get(indice_de(m["ticker"])), opts)
         if mm:
-            complet.append(mm)
-    reg = {i: regime_marche(data, i) for i in (INDICE_EUROPE, INDICE_US)}
+            complet.append(appliquer_style(mm, _style(opts)))
+    reg = {i: regime_marche(data, i) for i in TOUS_INDICES}
     for m in complet:
         ajuster_regime(m, reg[indice_de(m["ticker"])], macro_de(meteo, m["ticker"]))
     complet.sort(key=lambda m: -m["note"])
-    regimes = [reg[i] for i in ([INDICE_EUROPE] if opts.univers in ("pea", "europe") else
-                                [INDICE_US] if opts.univers == "us" else [INDICE_EUROPE, INDICE_US])]
+    regimes = [reg[i] for i in indices_de_univers(opts.univers) if reg[i]["etat"] != "inconnu" or i in (INDICE_EUROPE, INDICE_US)]
     return {"top": complet[:opts.top], "complet": complet, "regimes": regimes, "n_analyse": len(res), "meteo": meteo}
 
 
@@ -998,17 +1418,25 @@ def html_scan(r, opts):
     if r.get("meteo"):
         import macro
         corps += macro.html_meteo(r["meteo"])
-    corps += "".join(f"<p class='small'><b>{'Europe' if g['indice'] == INDICE_EUROPE else 'États-Unis'} :</b> "
+    corps += "".join(f"<p class='small'><b>Marché {NOMS_INDICES.get(g['indice'], ('', ''))[1]} :</b> "
                     f"{CONSEIL_REGIME[g['etat']]}</p>" for g in r["regimes"])
-    corps += ("<h2>Classement du jour</h2><table><tr><th>#</th><th>Action</th><th>Note</th><th>Avis</th><th>Momentum</th>"
-              "<th>Tendance</th><th>Proba.</th><th>Perf. 6 m</th><th>P(objectif) *</th><th>Stop</th><th>Taille</th></tr>")
+    valeur = (r["top"][0].get("style", "valeur") == "valeur") if r["top"] else True
+    cols = (["valeur", "qualite", "retournement"] if valeur else ["momentum", "tendance", "probabilites"])
+    corps += ("<h2>Classement du jour</h2><table><tr><th>#</th><th>Action</th><th>Note</th><th>Avis</th>"
+              + "".join(f"<th>{LIBELLES[k].split(' (')[0]}</th>" for k in cols)
+              + ("<th>PER</th><th>Sous le plus haut</th>" if valeur else "<th>Perf. 6 m</th>")
+              + "<th>P(objectif) *</th><th>Stop</th><th>Taille</th></tr>")
     for i, m in enumerate(r["top"], 1):
         bn, bh = m.get("boot_neutre") or {}, m.get("boot_hist") or {}
         pmix = (bn.get("p_objectif", 0) + bh.get("p_objectif", 0)) / 2
+        pe = (m.get("fonda") or {}).get("trailingPE")
+        pe = None if pe is None or (isinstance(pe, float) and np.isnan(pe)) else pe
         corps += (f"<tr><td>{i}</td><td><b>{html.escape(m['nom'])}</b><br><span class='muted'>{m['ticker']}</span></td>"
-                  f"<td>{_bar(m['note'])}</td><td>{_badge(m['verdict'])}</td><td>{_bar(m['scores']['momentum'])}</td>"
-                  f"<td>{_bar(m['scores']['tendance'])}</td><td>{_bar(m['scores']['probabilites'])}</td><td>{_f(m['r6m'])}</td>"
-                  f"<td>{pmix:.0%}</td><td>−{m['stop_pct']:.1%}</td><td>{_taille(m)}</td></tr>")
+                  f"<td>{_bar(m['note'])}</td><td>{_badge(m['verdict'])}</td>"
+                  + "".join(f"<td>{_bar(m['scores'].get(k))}</td>" for k in cols)
+                  + (f"<td>{_f(pe, '{:.1f}') if pe and pe > 0 else 'perte' if pe else 'n.d.'}</td><td>{_f(m['dist52'])}</td>"
+                     if valeur else f"<td>{_f(m['r6m'])}</td>")
+                  + f"<td>{pmix:.0%}</td><td>−{m['stop_pct']:.1%}</td><td>{_taille(m)}</td></tr>")
     corps += (f"</table><div class='small muted'>* Probabilité moyenne de toucher +{opts.objectif:.0f} % avant le stop en {opts.horizon} jours "
               "(moyenne des simulations « tendance continue » et « hasard pur »).</div><h2>Détail et raisons</h2>")
     return corps + "".join(carte_html(m, opts) for m in r["top"])
@@ -1030,12 +1458,20 @@ def analyse(opts, requetes, data_fn=None, meteo=None):
         if t not in data:
             erreurs.append(f"Pas de données pour {t} (vérifie le ticker Yahoo : .PA Paris, .DE Francfort, .AS Amsterdam…)")
             continue
-        m = analyser(t, noms.get(t, nom), data[t], data.get(indice_de(t)), opts)
+        iu = infos_univers(t)
+        m = analyser(t, noms.get(t, nom), data[t], data.get(indice_de(t)), opts, secteur=iu.get("secteur") or None,
+                     region=iu.get("region") or None)
         if m is None:
             erreurs.append(f"Historique trop court pour {t}")
             continue
         if m["fonda"].get("longName"):
             m["nom"] = m["fonda"]["longName"]
+        for c in ("pea_bourso", "cto", "region", "taille", "pays"):
+            m[c] = iu.get(c) or m.get(c, "")
+        if not iu:
+            for st_ in m["styles"].values():
+                st_["alertes"].append("Action hors de la liste PEA BoursoBank / Trade Republic : vérifie qu'elle est disponible chez ton courtier")
+        m["style"] = _style(opts)
         ajuster_regime(m, regime_marche(data, indice_de(t)), macro_de(meteo, t))
         ok.append(m)
     regimes = [regime_marche(data, i) for i in sorted({indice_de(m["ticker"]) for m in ok})]
@@ -1051,7 +1487,7 @@ def backtest(opts, data=None):
     chaque fin de mois on achète les N meilleures actions, à poids égal, on garde un mois.
     Frais : spread + 1 € par ordre. Filtre de marché : liquidités si l'indice est sous sa moyenne 200 j."""
     univ = charger_univers(opts.univers)
-    indice = INDICE_EUROPE if opts.univers in ("pea", "europe") else INDICE_US   # semis : S&P 500
+    indice = INDICE_EUROPE if opts.univers in ("pea", "europe") else INDICE_US
     if data is None:
         data = telecharger(list(univ) + [indice], annees=16, demo=opts.demo)
     closes = pd.DataFrame({t: data[t].Close for t in univ if t in data}).sort_index().ffill(limit=5)
@@ -1076,9 +1512,31 @@ def backtest(opts, data=None):
     volu = 50 + 25 * np.tanh(np.log(rvol.clip(lower=1e-3))) + 25 * np.tanh((upv / dnv - 1) * 2)
     mdd = closes / closes.rolling(252).max() - 1
     risq = 100 - 70 * ((vol - 0.2) / 0.6).clip(0, 1) - 30 * ((-mdd - 0.15) / 0.45).clip(0, 1)
-    w = {k: POIDS[k] for k in ("momentum", "tendance", "volume", "risque")}
-    note = (w["momentum"] * mom + w["tendance"] * tend + w["volume"] * volu + w["risque"] * risq) / sum(w.values())
-    note = note - 10 * (closes <= ma200)
+    if _style(opts) == "valeur":
+        # Version « cours seulement » du style valeur (les fondamentaux passés ne sont pas disponibles gratuitement)
+        d = (-dist52).clip(0, 1)
+        dec = pd.DataFrame(np.interp(d.values, [0, 0.05, 0.2, 0.5, 0.7, 1.0], [15, 20, 85, 85, 40, 25]),
+                           index=d.index, columns=d.columns).where(d.notna())
+        r2a = closes / closes.shift(504) - 1
+        lt = 50 - 40 * np.tanh(r2a / 0.5)
+        ma20 = closes.rolling(20).mean()
+        delta = closes.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        perte = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi_ = 100 - 100 / (1 + gain / perte.replace(0, np.nan))
+        lows = pd.DataFrame({t: data[t].Low for t in closes.columns}).reindex(closes.index).ffill(limit=5)
+        reprise = (closes > ma50) & ((closes < ma50).shift(1).rolling(15).max() > 0)
+        ret = (25 * reprise + 12 * ((closes > ma50) & ~reprise)
+               + 20 * ((rsi_.rolling(15).min() < 40) & (rsi_ > 50))
+               + 20 * (lows.rolling(10).min() > lows.shift(10).rolling(20).min())
+               + 15 * (ma20 > ma20.shift(5)) + 10 * (upv / dnv > 1.1)
+               + 10 * (closes > closes.shift(21))).clip(upper=100)
+        couteau = (closes < ma20) & (ma20 < ma20.shift(5)) & (closes / closes.shift(21) - 1 < -0.08)
+        note = (0.25 * dec + 0.15 * lt + 0.40 * ret + 0.20 * risq) - 12 * couteau
+    else:
+        w = {k: POIDS[k] for k in ("momentum", "tendance", "volume", "risque")}
+        note = (w["momentum"] * mom + w["tendance"] * tend + w["volume"] * volu + w["risque"] * risq) / sum(w.values())
+        note = note - 10 * (closes <= ma200)
     liq = (closes * vols).rolling(20).mean()
     note = note.where(liq > LIQUIDITE_MIN)
 
@@ -1108,7 +1566,7 @@ def backtest(opts, data=None):
                 "Pire baisse": float((eq / eq.cummax() - 1).min()),
                 "Mois positifs": (x[x != 0] > 0).mean() if (x != 0).any() else np.nan,
                 "Total": eq.iloc[-1] - 1}
-    tab = pd.DataFrame({f"Score (top {opts.top})": stats(s), "Indice": stats(si),
+    tab = pd.DataFrame({f"Score {_style(opts)} (top {opts.top})": stats(s), "Indice": stats(si),
                         "Toutes les actions à poids égal": stats(se)})
     fmt = tab.copy().astype(object)
     for row in tab.index:
@@ -1119,11 +1577,12 @@ def backtest(opts, data=None):
     t = exces.mean() / (exces.std() / math.sqrt(len(exces)))
     eqs = pd.DataFrame({"Score": (1 + s).cumprod(), "Indice": (1 + si).cumprod(), "Poids égal": (1 + se).cumprod()})
     return {"tableau": fmt, "exces": float(exces.mean()), "t": float(t), "exposition": float(np.mean(exp)),
-            "debut": fins[0].date(), "fin": fins[-1].date(), "mois": len(s), "courbes": eqs}
+            "debut": fins[0].date(), "fin": fins[-1].date(), "mois": len(s), "courbes": eqs, "style": _style(opts)}
 
 
 def html_backtest(b):
-    corps = (f"<div class='card'><h2>Résultats {b['debut']} → {b['fin']} ({b['mois']} mois)</h2>" + b["tableau"].to_html(border=0) +
+    corps = (f"<div class='card'><h2>{STYLES.get(b.get('style'), 'Score')} — {b['debut']} → {b['fin']} ({b['mois']} mois)</h2>"
+             + b["tableau"].to_html(border=0) +
              f"<p>Surperformance mensuelle moyenne vs indice : <b>{b['exces']:+.2%}</b> (t-stat {b['t']:.2f} ; au-dessus de 2 = significatif). "
              f"Investi {b['exposition']:.0%} du temps (liquidités quand l'indice est sous sa moyenne 200 jours).</p>"
              "<p class='small muted'>Biais du survivant : l'univers contient les actions d'aujourd'hui (les faillites passées n'y sont pas). "
@@ -1144,7 +1603,7 @@ def html_backtest(b):
 
 
 def html_regimes(regimes):
-    return "".join(f'<div class="regime {r["etat"]}"><b>Marché {("européen" if r["indice"] == INDICE_EUROPE else "américain")} : '
+    return "".join(f'<div class="regime {r["etat"]}"><b>Marché {NOMS_INDICES.get(r["indice"], ("", ""))[1]} : '
                    f'{r["etat"]}</b> — {html.escape(r["texte"])}</div>' for r in regimes)
 
 
@@ -1181,63 +1640,78 @@ def _dejson(x):
 
 def recalculer_taille(m, capital, risque):
     ecart = m["prix"] - m["stop"]
-    qte = capital * risque / 100 / ecart if ecart > 0 else 0
-    qte = min(qte, 0.25 * capital / m["prix"])
+    cap = capital * taux(m["ticker"])
+    qte = cap * risque / 100 / ecart if ecart > 0 else 0
+    qte = min(qte, 0.25 * cap / m["prix"])
     m["quantite"] = int(max(0, math.floor(qte)))
     m["montant"] = float(m["quantite"] * m["prix"])
+    m["montant_eur"] = m["montant"] / taux(m["ticker"])
     return m
 
 
 def preparer(opts, sortie="resultats/resultats.json.gz"):
     """Calcul complet, prévu pour tourner chaque nuit (GitHub Actions) :
-    1) cours sur 2 ans pour toutes les actions -> note rapide,
-    2) analyse complète (10 ans, probabilités, fondamentaux) des meilleures de chaque univers,
-    3) macro, 4) backtest (option). Résultat : un fichier JSON compressé lu par l'appli."""
+    1) cours sur 2 ans + valorisation de toutes les actions -> notes rapides (2 styles),
+    2) analyse complète (10 ans, probabilités, fondamentaux détaillés) des meilleures de chaque univers et style,
+    3) backtest (option). Résultat : un fichier JSON compressé lu par l'appli."""
     import gzip
     import json
     import time
+    global MEDIANES
     t0 = time.time()
     u = _lire_univers()
     tickers = list(u.ticker)
     info = u.set_index("ticker")
-    print(f"1/4 Cours sur 2 ans de {len(tickers)} actions…")
+    cols_info = [c for c in ("region", "pea", "pea_bourso", "cto", "secteur", "taille", "pays") if c in info]
+    print(f"1/4 Cours sur 2 ans et valorisation de {len(tickers)} actions…")
+    maj_change(opts.demo)
     data = telecharger(tickers + INDICES_AUX, annees=2.3, demo=opts.demo)
-    lignes, rapides = [], {}
+    masse = fonda_masse(tickers, demo=opts.demo)
+    MEDIANES = calculer_medianes(masse, dict(zip(u.ticker, u.secteur)), dict(zip(u.ticker, u.region)))
+    print("   médianes PER :", {k: round(v["pe"], 1) for k, v in MEDIANES.items()})
+    lignes = []
     for t in tickers:
         if t not in data:
             continue
         try:
-            m = analyser(t, info.at[t, "nom"], data[t], data.get(indice_de(t)), opts, avec_fonda=False, avec_proba=False)
+            m = analyser(t, info.at[t, "nom"], data[t], data.get(indice_de(t)), opts, avec_fonda=False,
+                         avec_proba=False, fonda_pre=masse.get(t), secteur=info.at[t, "secteur"] or None,
+                         region=info.at[t, "region"] or None)
         except Exception:
             m = None
         if not m or m["liquidite"] < LIQUIDITE_MIN / 4:
             continue
-        rapides[t] = m
-        lignes.append({"ticker": t, "nom": m["nom"], "note": m["note"], "verdict": m["verdict"], "prix": m["prix"],
-                       "r1m": m["r1m"], "r6m": m["r6m"], "r12_1": m["r12_1"], "dist52": m["dist52"], "vol": m["vol"],
-                       "rsi": m["rsi"], "liquidite": m["liquidite"], **{f"s_{k}": v for k, v in m["scores"].items()},
-                       **{c: info.at[t, c] for c in ("region", "pea", "secteur", "taille", "pays")}})
+        f = masse.get(t, {})
+        lignes.append({"ticker": t, "nom": m["nom"], "note": m["note_valeur"], "note_valeur": m["note_valeur"],
+                       "note_momentum": m["note_momentum"], "prix": m["prix"], "per": f.get("trailingPE"),
+                       "pb": f.get("priceToBook"), "r1m": m["r1m"], "r6m": m["r6m"], "r12_1": m["r12_1"],
+                       "r2a": m["r2a"], "dist52": m["dist52"], "vol": m["vol"], "rsi": m["rsi"],
+                       "liquidite": m["liquidite"], "reprise50": m["reprise50"], "couteau": m["couteau"],
+                       **{f"s_{k}": v for st_ in m["styles"].values() for k, v in st_["scores"].items()},
+                       **{c: info.at[t, c] for c in cols_info}})
     tab = pd.DataFrame(lignes)
     print(f"   {len(tab)} actions notées sur {len(tickers)} ({time.time() - t0:.0f} s)")
-    # finalistes : les meilleures de chaque univers
+    # finalistes : les meilleures de chaque univers, secteur et taille, dans chacun des deux styles
     final = set()
     tabc = tab.assign(coeur=tab.ticker.map(info["coeur"]) if "coeur" in info else "1")
-    for choix in UNIVERS_CHOIX:
-        final |= set(filtrer_univers(tabc, choix).nlargest(60, "note").ticker)
-    for _, g in tabc.groupby("secteur"):          # les meilleures de chaque secteur, pour le filtre par secteur
-        final |= set(g.nlargest(20, "note").ticker)
-    for _, g in tabc.groupby("taille"):           # et de chaque taille
-        final |= set(g.nlargest(25, "note").ticker)
+    for col in ("note_valeur", "note_momentum"):
+        for choix in UNIVERS_CHOIX:
+            final |= set(filtrer_univers(tabc, choix).nlargest(50, col).ticker)
+        for _, g in tabc.groupby("secteur"):
+            final |= set(g.nlargest(15, col).ticker)
+        for _, g in tabc.groupby("taille"):
+            final |= set(g.nlargest(20, col).ticker)
     final = sorted(final)
     print(f"2/4 Analyse complète de {len(final)} finalistes…")
     data10 = telecharger(final + INDICES_AUX, annees=10, demo=opts.demo)
     meteo = meteo_macro(opts.demo)
-    reg = {i: regime_marche(data10, i) for i in (INDICE_EUROPE, INDICE_US)}
+    reg = {i: regime_marche(data10, i) for i in TOUS_INDICES}
     complets = []
     for i, t in enumerate(final, 1):
         df = data10.get(t, data.get(t))
         try:
-            m = analyser(t, info.at[t, "nom"], df, data10.get(indice_de(t)), opts)
+            m = analyser(t, info.at[t, "nom"], df, data10.get(indice_de(t)), opts,
+                         fonda_pre=masse.get(t), secteur=info.at[t, "secteur"] or None, region=info.at[t, "region"] or None)
         except Exception as e:  # noqa
             print("   !", t, e)
             continue
@@ -1246,7 +1720,7 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
         if (m.get("fonda") or {}).get("longName"):
             m["nom"] = m["fonda"]["longName"]
         ajuster_regime(m, reg[indice_de(t)], macro_de(meteo, t))
-        for c in ("region", "pea", "secteur", "taille", "pays"):
+        for c in cols_info:
             m[c] = info.at[t, c]
         complets.append(m)
         if not opts.demo:
@@ -1255,19 +1729,25 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
             print(f"   {i}/{len(final)}")
     bt = None
     if getattr(opts, "avec_backtest", False):
-        print("3/4 Backtest sur la liste courte…")
-        try:
-            o = argparse.Namespace(**vars(opts))
-            o.univers, o.top, o.debut = "coeur", 15, "2012-01-01"
-            bt = backtest(o)
-            bt["courbes"] = {k: _json(v) for k, v in bt["courbes"].items()}
-            bt["tableau"] = bt["tableau"].to_dict()
-        except Exception as e:  # noqa
-            print("   ! backtest :", e)
-    res = {"date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "n_univers": len(tickers), "n_notees": len(tab),
-           "table": tab.to_dict(orient="list"), "finalistes": [_json(m) for m in complets],
+        print("3/4 Backtests des deux styles sur la liste courte…")
+        bt = {}
+        donnees_bt = None
+        for style in ("valeur", "momentum"):
+            try:
+                o = argparse.Namespace(**vars(opts))
+                o.univers, o.top, o.debut, o.style = "coeur", 15, "2012-01-01", style
+                if donnees_bt is None:
+                    donnees_bt = telecharger(list(charger_univers("coeur")) + [INDICE_US], annees=16, demo=opts.demo)
+                b = backtest(o, data=donnees_bt)
+                b["courbes"] = {k: _json(v) for k, v in b["courbes"].items()}
+                b["tableau"] = b["tableau"].to_dict()
+                bt[style] = b
+            except Exception as e:  # noqa
+                print("   ! backtest", style, ":", e)
+    res = {"version": 2, "date": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "n_univers": len(tickers),
+           "n_notees": len(tab), "table": _json(tab.to_dict(orient="list")), "finalistes": [_json(m) for m in complets],
            "regimes": _json(reg), "meteo": _json(meteo), "backtest": _json(bt) if bt else None,
-           "params": {"objectif": opts.objectif, "horizon": opts.horizon}}
+           "medianes": MEDIANES, "change": CHANGE, "params": {"objectif": opts.objectif, "horizon": opts.horizon}}
     os.makedirs(os.path.dirname(sortie), exist_ok=True)
     with gzip.open(sortie, "wt", encoding="utf-8") as f:
         json.dump(res, f)
@@ -1275,12 +1755,20 @@ def preparer(opts, sortie="resultats/resultats.json.gz"):
     return sortie
 
 
+def _backtest_de(b):
+    b = _dejson(b)
+    b["tableau"] = pd.DataFrame(b["tableau"])
+    b["courbes"] = pd.DataFrame(b["courbes"])
+    return b
+
+
 def charger_resultats(source):
-    """Lit le fichier préparé (chemin local ou URL)."""
+    """Lit le fichier préparé (chemin local ou URL). Compatible avec l'ancien format (un seul style)."""
     import gzip
     import io
     import json
     import urllib.request
+    global MEDIANES
     if source.startswith("http"):
         with urllib.request.urlopen(source, timeout=60) as r:
             brut = r.read()
@@ -1289,14 +1777,23 @@ def charger_resultats(source):
         f = gzip.open(source, "rt", encoding="utf-8")
     res = json.load(f)
     res["table"] = pd.DataFrame(res["table"])
+    if "note_valeur" not in res["table"]:
+        res["table"]["note_valeur"] = np.nan
+        res["table"]["note_momentum"] = res["table"]["note"]
     res["finalistes"] = [_dejson(m) for m in res["finalistes"]]
+    for m in res["finalistes"]:
+        if "styles" not in m:       # ancien format
+            m["styles"] = {"momentum": {k: m[k] for k in ("note", "verdict", "scores", "positifs", "negatifs", "alertes")}}
+            m["note_momentum"], m["note_valeur"] = m["note"], np.nan
     res["regimes"] = _dejson(res["regimes"])
     res["meteo"] = _dejson(res["meteo"]) if res.get("meteo") else None
-    if res.get("backtest"):
-        b = _dejson(res["backtest"])
-        b["tableau"] = pd.DataFrame(b["tableau"])
-        b["courbes"] = pd.DataFrame(b["courbes"])
-        res["backtest"] = b
+    if res.get("medianes"):
+        MEDIANES = res["medianes"]
+    if res.get("change"):
+        CHANGE.update(res["change"])
+    b = res.get("backtest")
+    if b:
+        res["backtest"] = {"momentum": _backtest_de(b)} if "tableau" in b else {k: _backtest_de(v) for k, v in b.items()}
     return res
 
 
@@ -1347,7 +1844,8 @@ def main():
     p = argparse.ArgumentParser(description="Radar actions : sélection quantitative pour le swing trading")
     p.add_argument("commande", choices=["scan", "analyse", "backtest", "preparer"])
     p.add_argument("actions", nargs="*", help="actions à analyser (tickers Yahoo ou noms)")
-    p.add_argument("--univers", default="tout", help="pea | europe | us | tout | petites | semis | coeur | fichier.txt")
+    p.add_argument("--univers", default="tout", help="tout | pea | cto | europe | us | petites | coeur | fichier.txt")
+    p.add_argument("--style", default="valeur", choices=list(STYLES), help="valeur (sous-cotées en retournement) ou momentum")
     p.add_argument("--top", type=int, default=15)
     p.add_argument("--capital", type=float, default=10000)
     p.add_argument("--risque", type=float, default=1.0, help="% du capital risqué par trade")
