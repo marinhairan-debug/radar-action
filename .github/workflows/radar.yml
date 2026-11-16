@@ -2,9 +2,9 @@ name: Calcul du radar
 
 on:
   schedule:
-    - cron: "30 22 * * 1-5"   # du lundi au vendredi, 23 h 30 heure de Paris (hiver)
+    - cron: "30 22 * * 1-5"   # du lundi au vendredi, 23 h 30 heure de Paris (hiver), après la clôture américaine
     - cron: "0 6 * * 6"       # samedi matin : calcul complet + backtest
-  workflow_dispatch:
+  workflow_dispatch:          # bouton « Run workflow » pour lancer à la main
     inputs:
       backtest:
         description: "Refaire aussi le backtest ?"
@@ -17,7 +17,7 @@ permissions:
 jobs:
   radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +32,7 @@ jobs:
           BT=""
           if [ "${{ github.event.schedule }}" = "0 6 * * 6" ] || [ "${{ inputs.backtest }}" = "true" ]; then BT="--avec-backtest"; fi
           python radar_actions.py preparer $BT
-      - name: Publication du résultat (branche donnees)
+      - name: Publication du résultat (branche « donnees »)
         run: |
           cd resultats
           git init -q -b donnees
@@ -41,3 +41,10 @@ jobs:
           git add resultats.json.gz
           git commit -q -m "Résultats du $(date -u +%F)"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" donnees
+      - name: Suivi de mon portefeuille (dépôt privé, ignoré si non configuré)
+        if: always()
+        continue-on-error: true
+        env:
+          PORTEFEUILLE_TOKEN: ${{ secrets.PORTEFEUILLE_TOKEN }}
+          PORTEFEUILLE_REPO: ${{ secrets.PORTEFEUILLE_REPO }}
+        run: python portefeuille.py suivi
